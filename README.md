@@ -263,6 +263,65 @@ compute its scores, or answer `validation: null` if the layer fails.
 The format checks above (`quality`) stay as they are; the Critic's scores (`validation`) show
 next to them in the API and in the dashboard. More in `gigabrain/validation/README.md`.
 
+## Memory and traceability service (optional)
+
+GigaBrain can send everything its agents do to a separate service, and keep the PO's decisions and
+documents in that service's memory, so that the agents (and the next conversations) can use them. It is
+**off** unless asked for: without `--hub`, GigaBrain runs exactly as before, and `evaluate` and `demo`
+never use it (a memory would carry one run into the next).
+
+```bash
+export GIGABRAIN_HUB_URL=http://localhost:8002        # address of the service (required)
+python main.py chat --hub                             # or: python main.py api --hub
+```
+
+| Variable | Default | Use |
+|---|---|---|
+| `GIGABRAIN_HUB_URL` | | address of the service (required with `--hub`) |
+| `GIGABRAIN_HUB_TOKEN` | | bearer token, if the service asks for one |
+| `GIGABRAIN_HUB_TRACE` | on | `0`: do not send what the agents do |
+| `GIGABRAIN_HUB_MEMORY` | on | `0`: do not write to the memory nor give memory to the agents |
+| `GIGABRAIN_HUB_USER` | `po` | who the conversations belong to (there is no login yet) |
+| `GIGABRAIN_HUB_MIN_SCORE` | 0.1 | a memory excerpt scoring less is not shown to an agent |
+| `GIGABRAIN_HUB_PERSON_MEMORY` | on | `0`: the Twin does not remember what the PO says (Mem0); decisions and documents stay |
+| `GIGABRAIN_HUB_PERSON_MIN_SCORE` | 0.2 | a fact about the PO scoring less is not shown to the Twin |
+
+**Traceability.** Every call to the LLM (prompt version, messages, answer, tokens) and every message between
+agents is sent in the background, in order. A conversation is a session; each thing the PO does (a message, a
+meeting, an approval, a rejection, closing) is an execution of the Twin, and the Leader, experts and Critic it
+calls are child executions. If the service is down, the conversation goes on and what could not be sent stays
+in GigaBrain's own log.
+
+**Memory.** What is written, always as a short record and never edited:
+
+- a draft the PO **approved**: reason, who decided, links, **what changed from the version before**, and what had
+  changed the draft before it was approved;
+- a draft the PO **rejected** (`DELETE .../drafts/{id}` takes an optional `{"reason": "..."}`, or by asking the Twin to
+  drop it, and then their words are the reason) and one they **restored**;
+- a draft that **changed** before approval: what changed and why (the PO's message, or a later part of a meeting);
+- a draft left unapproved when the conversation **closes** (`POST .../close` takes an optional `{"reason": "..."}`);
+- a **summary** of each conversation when it closes: what the PO asked for, how the drafts ended, what is still open;
+- the files the PO attaches, as documents (the service reads each one as a whole and gives every piece its context).
+
+What the agents get: when a conversation opens, the Twin receives the latest records of the project (where the last
+conversations stopped). When the Twin consults, each expert searches the memory for the question it was asked, and
+what it finds goes into its prompt. Those excerpts are logged (`memory_recall`), cited by the requirement that is
+saved, and accepted by the Critic as a source. A prompt only gets the paragraph about memory when there is memory
+to give, so it is its own version in the service. The experts that review the drafts of a meeting do not search the
+memory (one search for each draft would be too slow).
+
+**The Twin's memory of the PO (Mem0).** Apart from the exact records, the Twin remembers what the PO says: short
+facts about the PO and the project (preferences, context, how they work) that Mem0 extracts, updates and forgets with an
+LLM. Before each answer the Twin gets the facts that fit the message (`po_memory`); after it, the turn (the PO's message,
+with the Twin's previous one as context, and the Twin's answer) goes to Mem0 in the background. Only the talk goes there:
+approvals, meetings and files are kept exactly in the other memory, so nothing is stored twice. Where the two disagree on a
+decision, the record wins (the prompt says so), and the facts are context for the Critic, never a source. It costs one LLM
+call of Mem0 for each turn. There is no login yet: the memory is one for each project and for the user
+`GIGABRAIN_HUB_USER`.
+
+Files: `gigabrain/hub/` (settings, client, queue, `hub.py`, `decisions.py`), a few lines in `agents/base.py`,
+`log.py`, `council.py` and `api.py`, and `tests/test_hub.py`.
+
 ## Experts
 
 The knowledge of each expert is in `data/knowledge/<topic>.md`, with fixed sections: business
@@ -552,6 +611,7 @@ The draft of the evaluation method for the paper is in `docs/evaluation-method.m
 | `gigabrain/agents/` | Twin, Leader, Expert and Critic |
 | `gigabrain/validation/` | the checks, the gate and the report the Critic uses |
 | `gigabrain/validation_read.py` | the scores of a saved requirement, for the API and the dashboard |
+| `gigabrain/hub/` | optional connection to the memory and traceability service |
 | `gigabrain/council.py` | conversation with the PO: messages, meetings and drafts |
 | `gigabrain/transcript.py` | turns a pasted meeting into utterances |
 | `gigabrain/documents.py` | text of the files attached in the chat |

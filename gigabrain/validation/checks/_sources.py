@@ -41,7 +41,7 @@ def said_by_someone(source: SourceDocument) -> str:
     """
     if source.kind == "requirement":
         return ""
-    if source.kind == "expert":
+    if source.kind in ("expert", "memory"):  # a decision record repeats the requirement it records
         return "\n".join(line for line in source.text.splitlines() if not _REQUIREMENT_ID.search(line))
     return source.text
 

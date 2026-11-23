@@ -64,6 +64,23 @@ def _validation(args):
                               judge=getattr(args, "validation_judge", False))
 
 
+def _hub(args):
+    """Settings of the connection to the memory and traceability service, if --hub was given (hub/settings.py)."""
+    if not getattr(args, "hub", False):
+        return None
+    from gigabrain.hub import HubConfigError, HubSettings
+    try:
+        return HubSettings.from_env()
+    except HubConfigError as exc:
+        sys.exit(f"Error: {exc}")
+
+
+def _hub_option(p) -> None:
+    p.add_argument("--hub", action="store_true",
+                   help="send what the agents do to the traceability service and keep decisions in its memory "
+                        "(address in GIGABRAIN_HUB_URL; GIGABRAIN_HUB_TRACE=0 or GIGABRAIN_HUB_MEMORY=0 turn one off)")
+
+
 def _validation_options(p, batch: bool = False) -> None:
     p.add_argument("--no-validation", action="store_true", help="run without the Critic (ablation)")
     p.add_argument("--validation-rounds", type=int, default=1, metavar="N",
@@ -104,7 +121,8 @@ def _print_requirement(req: dict) -> None:
 
 def cmd_chat(args) -> None:
     provider = _provider(args.simulated)
-    ctx = open_context(args.data, provider, mode=args.mode, show_agents=not args.quiet, validation=_validation(args))
+    ctx = open_context(args.data, provider, mode=args.mode, show_agents=not args.quiet, validation=_validation(args),
+                       hub=_hub(args))
     council = Council(ctx)
     conversation = council.start()
 
@@ -359,10 +377,13 @@ def cmd_api(args) -> None:
     factory = (lambda key=None: SimulatedProvider()) if args.simulated else (lambda key=None: create_provider("deepseek", key))
     token = args.token or os.environ.get("GIGABRAIN_API_TOKEN")
     origins = [o.strip() for o in args.origins.split(",")] if args.origins else ["*"]
-    app = create_app(args.data, factory, origins=origins, token=token, validation=_validation(args))
+    hub = _hub(args)
+    app = create_app(args.data, factory, origins=origins, token=token, validation=_validation(args), hub=hub)
     print(f"GigaBrain API at http://{args.host}:{args.port}  ·  docs: http://{args.host}:{args.port}/docs")
     print(f"data: {os.path.abspath(args.data)} · provider: {'simulated' if args.simulated else 'deepseek'}"
           f" · token: {'yes' if token else 'no'} · origins: {', '.join(origins)}")
+    if hub:
+        print(f"hub: {hub.url} · trace: {'on' if hub.trace else 'off'} · memory: {'on' if hub.memory else 'off'}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
@@ -378,6 +399,7 @@ def main() -> None:
     p.add_argument("--mode", choices=["after_meeting", "in_meeting"], default="after_meeting")
     p.add_argument("--quiet", action="store_true", help="hide the internal conversation of the agents")
     _validation_options(p)
+    _hub_option(p)
     p.set_defaults(func=cmd_chat)
 
     p = sub.add_parser("demo", help="run sample conversations with the simulated provider")
@@ -442,6 +464,7 @@ def main() -> None:
     p.add_argument("--origins", default="", help="CORS origins, comma-separated (default: all)")
     p.add_argument("--token", default="", help="require Authorization: Bearer <token> (or set GIGABRAIN_API_TOKEN)")
     _validation_options(p)
+    _hub_option(p)
     p.set_defaults(func=cmd_api)
 
     p = sub.add_parser("validate", help="score the requirements of the repository with the Critic (deterministic, no LLM)")

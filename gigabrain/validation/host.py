@@ -37,7 +37,7 @@ from .model import (
 from .report import to_summary
 
 #: Kinds of entries in the `sources` of a saved requirement that point to content.
-CONTENT_SOURCE_KINDS = ("turn", "conversation", "expert", "requirement")
+CONTENT_SOURCE_KINDS = ("turn", "conversation", "expert", "requirement", "memory")
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +219,27 @@ def requirement_source(db: Database, requirement_id: str) -> SourceDocument | No
                           origin=f"{requirement_id} v{req['current_version']}")
 
 
+def _memory_source(ref: str, records: list[dict]) -> SourceDocument:
+    first = records[0]
+    return SourceDocument(id=f"memory:{ref}", text="\n".join(r.get("text") or "" for r in records), kind="memory",
+                          origin=f"memory, {first.get('kind') or 'record'} {ref} of {first.get('date') or '?'}")
+
+
+def memory_sources(db: Database, conversation_id: str) -> list[SourceDocument]:
+    """What the memory handed the experts in a conversation (documents and past decisions), read from the log."""
+    found: dict[str, list[dict]] = {}
+    for content in _events(db, ("memory_recall",), conversation_id):
+        for record in content.get("records") or []:
+            found.setdefault(str(record.get("ref")), []).append(record)
+    return [_memory_source(ref, records) for ref, records in found.items()]
+
+
+def memory_source(db: Database, ref: str) -> SourceDocument | None:
+    """One record of the memory a saved requirement cites, as the log of the project kept it."""
+    records = [r for content in _events(db, ("memory_recall",)) for r in content.get("records") or [] if str(r.get("ref")) == ref]
+    return _memory_source(ref, records) if records else None
+
+
 def consulted_in(db: Database, conversation_id: str) -> tuple[list[str], list[str]]:
     """(experts consulted, related requirements) of a conversation, read from the log.
 
@@ -243,6 +264,7 @@ def conversation_evidence(db: Database, conversation_id: str) -> tuple[list[Evid
     experts, related = consulted_in(db, conversation_id)
     sources += [s for s in (expert_source(db, e) for e in experts) if s]
     sources += [s for s in (requirement_source(db, r) for r in related) if s]
+    sources += memory_sources(db, conversation_id)
     evidence = [EvidenceRef(source_id=s.id) for s in sources]
     dialogue = dialogue_source(db, conversation_id) if spoken else None
     return evidence, sources + ([dialogue] if dialogue else [])  # the dialogue is read, never cited
@@ -325,6 +347,9 @@ class RepositoryReader:
             elif kind == "expert":
                 source = self._cached(kind, ref, expert_source)
                 evidence.append(EvidenceRef(source_id=f"expert:{ref}"))
+            elif kind == "memory":
+                source = self._cached(kind, ref, memory_source)
+                evidence.append(EvidenceRef(source_id=f"memory:{ref}"))
             else:
                 source = self._cached(kind, ref, requirement_source)
                 evidence.append(EvidenceRef(source_id=f"requirement:{ref}"))

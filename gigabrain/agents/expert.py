@@ -40,6 +40,14 @@ Answer with a single JSON object:
 }
 """
 
+# Added to the answer prompt only when the memory had something for the question (see agents/twin.py, MEMORY_NOTE).
+MEMORY_NOTE = """
+The message may bring "memory": excerpts the memory service found for this question (documents of the project and
+decisions of earlier conversations), best first, each with a ref, a date, a score and its text. They are a second source
+next to your knowledge file: use them when they answer the question, say which ref you used, and never state more than they
+say. A decision record is history: what is true today is in the requirements you were given.
+"""
+
 CREATE_PROMPT = """\
 You are being born as a GigaBrain expert on a business topic. Build your initial knowledge file
 in Markdown, following exactly the sections of the template you receive. Use only the
@@ -282,10 +290,14 @@ class Expert(Agent):
     def answer(self, question: str, language: str | None = None) -> dict:
         self.sync()
         self.ctx.db.count_consultation(self.id)
-        answer = self.call_llm("expert_answer", ANSWER_PROMPT, [{"role": "user", "content": as_json({
+        memory = self.ctx.hub.recall(question, self.name) if self.ctx.hub else []
+        if memory:  # what the memory had is in the log, so the Critic can check a requirement against it
+            self.send(LEADER, "memory_recall", {"query": question, "topic": self.id, "records": memory})
+        answer = self.call_llm("expert_answer", ANSWER_PROMPT + (MEMORY_NOTE if memory else ""), [{"role": "user", "content": as_json({
             "question": question,
             "knowledge": self.read_knowledge(),
             "topic_requirements": self.topic_requirements(),
+            **({"memory": memory} if memory else {}),
             **({"language": language} if language else {}),
         })}])
         result = {
@@ -296,6 +308,7 @@ class Expert(Agent):
             "conflicts": (answer.get("conflicts") or []),
             "questions_for_po": (answer.get("questions_for_po") or []),
             "confidence": answer.get("confidence", "medium"),
+            **({"memory_refs": [m["ref"] for m in memory]} if memory else {}),
         }
         self.send(LEADER, "expert_answer", result)
         return result

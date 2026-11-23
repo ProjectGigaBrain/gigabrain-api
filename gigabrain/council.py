@@ -30,6 +30,7 @@ When a draft is approved:
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from . import requirement_format, transcript
@@ -54,8 +55,12 @@ DRAFT_SUMMARY = ("draft_id", "title", "statement", "class", "subtype", "topics",
 
 
 def open_context(data_folder: str, provider, mode: str = "after_meeting", show_agents: bool = False,
-                 validation: ValidationSettings | bool = True) -> Context:
-    """`validation`: True for the Critic with its defaults, settings to adjust it, False to run without it."""
+                 validation: ValidationSettings | bool = True, hub=None) -> Context:
+    """`validation`: True for the Critic with its defaults, settings to adjust it, False to run without it.
+
+    `hub`: the settings of the connection to the memory and traceability service (hub/), or None to run
+    without it, as every command does unless it is asked to. If the service cannot be reached, it runs without it too.
+    """
     os.makedirs(data_folder, exist_ok=True)
     db = Database(data_folder)
     recorder = Recorder(db, os.path.join(data_folder, "logs"), show_agents=show_agents)
@@ -63,11 +68,25 @@ def open_context(data_folder: str, provider, mode: str = "after_meeting", show_a
     if validation:
         from .agents.critic import Critic, ValidationSettings  # here so that an error in validation/ cannot stop a run without it
         ctx.critic = Critic(ctx, validation if isinstance(validation, ValidationSettings) else None)
+    if hub is not None:
+        from .hub import connect  # here so that a run without the hub never loads it
+        ctx.hub = connect(hub, os.path.basename(os.path.normpath(data_folder)), provider)
+        recorder.hub = ctx.hub
     return ctx
 
 
 def _record(ctx: Context, sender: str, recipient: str, kind: str, content: dict) -> None:
     ctx.recorder.record(Message(sender=sender, recipient=recipient, kind=kind, content=content, conversation_id=ctx.conversation_id))
+
+
+class _NoTurn:
+    def finish(self, result) -> None:
+        pass
+
+
+def _turn(ctx: Context, kind: str, **entrada):
+    """One thing the PO did, as one execution in the traceability service (nothing without the hub)."""
+    return ctx.hub.turn(kind, entrada) if ctx.hub else nullcontext(_NoTurn())
 
 
 class Council:
@@ -79,14 +98,39 @@ class Council:
         self.turns: list[dict] = []  # every utterance of the meetings sent in this conversation
         self.sources: list[dict] = []
         self.related: list[str] = []
+        # Kept only to be written in the memory when the conversation ends (hub/decisions.py).
+        self._po_messages: list[str] = []
+        self._history: dict[str, list[dict]] = {}  # draft id -> what changed it before it was approved
+        self._times: dict[tuple[str, str], int] = {}  # (draft id, "rejected"/"restored") -> how many times, to number the records
+        self._open_question: str | None = None
+        self._saved: list[str] = []
+        self._ended = False
+        self._last_twin_text: str | None = None  # what the Twin said last: the context of what the PO answers
 
     def start(self) -> str:
         self.ctx.conversation_id = self.ctx.db.start_conversation(self.ctx.mode)
+        hub = self.ctx.hub
+        if hub:
+            hub.open_session(self.ctx.conversation_id, self.ctx.mode)
+            self.twin.memory_note = hub.memory_on
+            with _turn(self.ctx, "open"):
+                records = hub.briefing()  # where the last conversations stopped
+                if records:
+                    self.twin.briefing = records
+                    _record(self.ctx, "memory", TWIN, "memory_briefing", {"records": records})
         return self.ctx.conversation_id
 
-    def end(self, status: str = "closed") -> None:
-        if self.ctx.conversation_id:
+    def end(self, status: str = "closed", reason: str | None = None) -> None:
+        """`reason`: why the PO is leaving with drafts not approved, if they said."""
+        if not self.ctx.conversation_id:
+            return
+        with _turn(self.ctx, "end", status=status):
+            if not self._ended:
+                self._ended = True
+                self._remember_ending(status, reason)
             self.ctx.db.end_conversation(self.ctx.conversation_id, status)
+        if self.ctx.hub:
+            self.ctx.hub.close_session()
 
     @classmethod
     def resume(cls, ctx: Context, conversation_id: str) -> Council:
@@ -102,13 +146,20 @@ class Council:
             if event["kind"] == "po_request":
                 council.twin.history.append({"role": "user", "content": as_json({"from": "po", "text": c.get("text", "")})})
                 council.twin.language = spoken_language(c.get("text", "")) or council.twin.language
+                council._po_messages.append(c.get("text", ""))
             elif event["kind"] in ("question_to_po", "proposal") and event["sender"] == TWIN:
                 action = "propose" if event["kind"] == "proposal" else "ask"
                 council.twin.history.append({"role": "assistant", "content": as_json({"action": action, "message_to_po": c.get("text", "")})})
+                council._last_twin_text = c.get("text") or None
             elif event["kind"] == "meeting":
                 council.turns += c.get("turns") or []
             elif event["kind"] == "draft_board":
                 council.drafts = c.get("drafts") or []
+            elif event["kind"] == "requirement_saved":
+                council._saved.append(c["requirement_id"])
+        if ctx.hub:
+            ctx.hub.open_session(conversation_id, ctx.mode)  # the same session as before the restart
+            council.twin.memory_note = ctx.hub.memory_on
         return council
 
     # ------------------------------------------------------------------ drafts
@@ -150,12 +201,19 @@ class Council:
         return [{k: d["requirement"].get(k) for k in DRAFT_SUMMARY} | {"draft_id": d["draft_id"], "origin": d["origin"]}
                 for d in self.drafts if d["status"] == "pending"]
 
-    def reject(self, draft_id: str) -> dict:
-        return self._set_status(draft_id, "pending", "rejected")
+    def reject(self, draft_id: str, reason: str | None = None) -> dict:
+        """`reason`: why the PO rejects it, if they said (it is kept in the memory)."""
+        with _turn(self.ctx, "reject", draft=draft_id):
+            draft = self._set_status(draft_id, "pending", "rejected")
+            self._remember_rejected(draft, reason)
+            return draft
 
     def restore(self, draft_id: str) -> dict:
         """Undo a rejection: the draft is pending again."""
-        return self._set_status(draft_id, "rejected", "pending")
+        with _turn(self.ctx, "restore", draft=draft_id):
+            draft = self._set_status(draft_id, "rejected", "pending")
+            self._remember_restored(draft)
+            return draft
 
     def _set_status(self, draft_id: str, before: str, after: str) -> dict:
         draft = self._draft(draft_id)
@@ -169,17 +227,32 @@ class Council:
 
     # ------------------------------------------------------------------ conversation
 
-    def talk(self, text: str) -> dict:
+    def talk(self, text: str, attachments: list[tuple[str, str]] | None = None) -> dict:
         """Receive a PO message and return what to show to the PO.
 
+        `attachments`: (name, text) of the files that came with it. Their text is already in `text`;
+        they are also kept in the memory, so that the experts can find them later.
         Returns {"action": "ask"|"propose"|"approved", "message_to_po": ..., "requirements": [...]}
         """
+        with _turn(self.ctx, "po_message", text=text) as turn:
+            answer = self._talk(text, attachments)
+            turn.finish({"action": answer.get("action"), "message_to_po": answer.get("message_to_po"),
+                         "proposed": len(answer.get("requirements") or []),
+                         "saved": [s["requirement_id"] for s in answer.get("saved") or []]})
+            return answer
+
+    def _talk(self, text: str, attachments: list[tuple[str, str]] | None) -> dict:
+        self._remember_attachments(attachments)
+        typed = text.split("--- Attached document:", 1)[0].strip() or text[:200]  # what the PO wrote, not the files
         if self.pending_proposal and is_approval(text):
             _record(self.ctx, PO, TWIN, "approval", {"text": text})
             return self.approve()
 
+        self._po_messages.append(typed)
+        self._open_question = None
         _record(self.ctx, PO, TWIN, "po_request", {"text": text})
-        decision = self.twin.hear_po(text, self._for_the_twin())
+        facts = self._recall_person(typed)
+        decision = self.twin.hear_po(text, self._for_the_twin(), facts)
 
         consultations = 0
         while decision["action"] == "consult":
@@ -199,12 +272,19 @@ class Council:
         if decision["action"] == "propose":
             sources = [*self.sources, *({"kind": "requirement", "ref": rid} for rid in self.related)]
             for requirement in decision["requirements"]:
-                self._put(requirement, "chat", list(sources), requirement.get("draft_id"))
+                before = self._snapshot(requirement.get("draft_id"))
+                draft_id, changed = self._put(requirement, "chat", list(sources), requirement.get("draft_id"))
+                if changed:  # what the PO said is why the draft changed
+                    self._remember_revised(draft_id, before, typed, "the PO said")
             for draft_id in decision.get("remove_drafts") or []:
                 draft = self._draft(draft_id)
                 if draft and draft["status"] == "pending":
                     draft["status"] = "rejected"
+                    self._remember_rejected(draft, typed)
             self._record_board()
+        elif decision["action"] == "ask":
+            self._open_question = decision.get("message_to_po")
+        self._remember_turn(typed, decision.get("message_to_po"))
         return decision
 
     def _keep_sources(self, answer: dict) -> None:
@@ -218,6 +298,13 @@ class Council:
     # ------------------------------------------------------------------ meeting
 
     def hear_meeting(self, text: str, title: str | None = None) -> dict:
+        with _turn(self.ctx, "meeting", title=title, chars=len(text)) as turn:
+            answer = self._hear_meeting(text, title)
+            turn.finish({"action": answer["action"], "new": len(answer["new"]), "changed": len(answer["changed"]),
+                         "discarded": answer["discarded"]})
+            return answer
+
+    def _hear_meeting(self, text: str, title: str | None = None) -> dict:
         """Read a meeting (or its next part) one utterance at a time and turn it into drafts.
 
         As in the evaluation: the Twin drafts, the Consultative Council recommends, the Critic
@@ -272,7 +359,11 @@ class Council:
                 if not replaces and self._repeats_a_draft(requirement["statement"]):
                     discarded += 1  # said again in a later part: the draft is already there
                     continue
+                before = self._snapshot(replaces)
                 draft_id, was_changed = self._put(requirement, "meeting", sources, replaces)
+                if was_changed:
+                    self._remember_revised(draft_id, before, "a later part of the meeting corrected it (" + ", ".join(draft["turns"]) + ")",
+                                           "the meeting")
                 (changed if was_changed else new).append(draft_id)
 
         self._record_board()
@@ -305,6 +396,12 @@ class Council:
 
     def approve(self, draft_ids: list[str] | None = None) -> dict:
         """Save the pending drafts (all of them, or only `draft_ids`). The conversation goes on."""
+        with _turn(self.ctx, "approval", drafts=draft_ids) as turn:
+            answer = self._approve(draft_ids)
+            turn.finish({"action": answer.get("action"), "saved": [s["requirement_id"] for s in answer.get("saved") or []]})
+            return answer
+
+    def _approve(self, draft_ids: list[str] | None) -> dict:
         chosen = [d for d in self.drafts if d["status"] == "pending" and (draft_ids is None or d["draft_id"] in draft_ids)]
         if not chosen:
             return {"action": "ask", "message_to_po": phrase("nothing_to_approve", self.twin.language), "requirements": []}
@@ -334,6 +431,8 @@ class Council:
                 self._note_in_expert(result, proposed)
             else:
                 self._update_experts(result)
+            self._saved.append(result["requirement_id"])
+            self._remember_approved(draft, proposed, result)
             saved.append(result)
 
         text = phrase("saved", self.twin.language, ids=", ".join(f"{s['requirement_id']} v{s['version']}" for s in saved))
@@ -341,6 +440,107 @@ class Council:
         self._record_board()
         self.ctx.db.set_conversation_status(self.ctx.conversation_id, "approved")
         return {"action": "approved", "message_to_po": text, "saved": saved, "requirements": self.pending_proposal or []}
+
+    # ------------------------------------------------------------------ memory of the decisions (hub/)
+
+    def _memory(self):
+        hub = self.ctx.hub
+        return hub if hub and hub.memory_on else None
+
+    @staticmethod
+    def _view(draft: dict) -> dict:
+        """A draft as the memory records it: its content now, and which revision it is."""
+        r = draft["requirement"]
+        return {**{k: r.get(k) for k in ("title", "statement", "class", "subtype", "topics", "story", "constraint",
+                                         "acceptance_criteria")},
+                "draft_id": draft["draft_id"], "origin": draft["origin"], "revision": draft.get("revision", 1)}
+
+    def _snapshot(self, draft_id: str | None) -> dict | None:
+        """How a pending draft is right now, to tell what changed once it is changed."""
+        draft = self._draft(draft_id)
+        return self._view(draft) if self._memory() and draft and draft["status"] == "pending" else None
+
+    def _remember(self, record) -> None:
+        hub = self._memory()
+        if hub:
+            _record(self.ctx, TWIN, "memory", "memory_saved",
+                    {"key": record.key, "type": record.metadata.get("tipo_registro"), "text": record.text})
+            hub.remember(record)
+
+    def _recall_person(self, typed: str) -> list[dict]:
+        """What the Twin remembers about the PO that fits what they just said (Mem0). It is in the log."""
+        hub = self.ctx.hub
+        facts = hub.recall_person(typed) if hub else []
+        if facts:
+            _record(self.ctx, "memory", TWIN, "memory_facts", {"query": typed, "facts": facts})
+        return facts
+
+    def _remember_turn(self, typed: str, answer: str | None) -> None:
+        """The Twin's own memory of the PO (Mem0) gets the talk: what the PO said and the Twin answered, with the
+        Twin's previous message as context ("yes" means something only next to the question). Only the talk:
+        decisions and files are kept exactly in the other memory, so they are not given to Mem0 as well."""
+        hub = self.ctx.hub
+        if hub and hub.person_memory_on and typed.strip():
+            messages = [{"role": "assistant", "content": self._last_twin_text[:1500]}] if self._last_twin_text else []
+            messages.append({"role": "user", "content": typed[:2000]})
+            if answer:
+                messages.append({"role": "assistant", "content": answer[:1500]})
+            hub.remember_turn(messages)
+        self._last_twin_text = answer
+
+    def _remember_attachments(self, files: list[tuple[str, str]] | None) -> None:
+        hub = self._memory()
+        for name, content in (files or []) if hub else []:
+            hub.remember_document(name, content)
+
+    def _remember_revised(self, draft_id: str, before: dict | None, reason: str, by: str) -> None:
+        if not self._memory() or before is None:
+            return
+        from .hub import decisions
+        self._history.setdefault(draft_id, []).append({"by": by, "reason": reason})
+        self._remember(decisions.draft_revised(conversation_id=self.ctx.conversation_id, draft=self._view(self._draft(draft_id)),
+                                               before=before, reason=reason, by=by))
+
+    def _remember_rejected(self, draft: dict, reason: str | None) -> None:
+        if self._memory():
+            from .hub import decisions
+            n = self._times[(draft["draft_id"], "rejected")] = self._times.get((draft["draft_id"], "rejected"), 0) + 1
+            self._remember(decisions.draft_rejected(conversation_id=self.ctx.conversation_id, draft=self._view(draft),
+                                                    reason=(reason or "").strip() or None, number=n))
+
+    def _remember_restored(self, draft: dict) -> None:
+        if self._memory():
+            from .hub import decisions
+            n = self._times[(draft["draft_id"], "restored")] = self._times.get((draft["draft_id"], "restored"), 0) + 1
+            self._remember(decisions.draft_restored(conversation_id=self.ctx.conversation_id, draft=self._view(draft), number=n))
+
+    def _remember_approved(self, draft: dict, proposed: dict, result: dict) -> None:
+        if not self._memory():
+            return
+        from .hub import decisions
+        req_id, versions = result["requirement_id"], self.ctx.db.requirement_versions(result["requirement_id"])
+        changes = decisions.diff_versions(versions[-2]["content"], versions[-1]["content"]) if len(versions) > 1 else None
+        self._remember(decisions.requirement_approved(
+            conversation_id=self.ctx.conversation_id, requirement_id=req_id, version=result["version"],
+            draft=self._view(draft), content=versions[-1]["content"], reason=proposed.get("reason"), links=result["links"],
+            decided_by="PO (explicit approval)", changes=changes, revisions=self._history.get(draft["draft_id"], [])))
+
+    def _remember_ending(self, status: str, reason: str | None) -> None:
+        """The conversation is over: what was never approved, and a summary for the next one to start from."""
+        if not self._memory():
+            return
+        from .hub import decisions
+        views = []
+        for d in self.drafts:
+            view = self._view(d)
+            if d["status"] == "pending":
+                self._remember(decisions.draft_abandoned(conversation_id=self.ctx.conversation_id, draft=view,
+                                                         reason=(reason or "").strip() or None))
+            views.append({**view, "status": "abandoned" if d["status"] == "pending" else d["status"]})
+        if self._po_messages or self.turns or self.drafts:
+            self._remember(decisions.session_summary(
+                conversation_id=self.ctx.conversation_id, status=status, po_messages=self._po_messages,
+                meeting_utterances=len(self.turns), drafts=views, saved=self._saved, open_question=self._open_question))
 
     def _note_in_expert(self, result: dict, proposed: dict) -> None:
         """A draft read from a meeting: the expert of its topic writes it down without the LLM, as in meeting.py."""

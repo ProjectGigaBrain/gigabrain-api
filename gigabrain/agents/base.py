@@ -37,6 +37,7 @@ class Context:
     conversation_id: str | None = None
     with_quality: bool = True  # consult the quality expert (FR/NFR class and subtype)
     critic: object | None = None  # the Critic agent (validation); None switches validation off
+    hub: object | None = None  # the connection to the memory and traceability service (hub/); None = not connected
 
 
 def requirement_summary(req: dict) -> dict:
@@ -70,18 +71,25 @@ class Agent:
     def call_llm(self, role: str, system: str, messages: list[dict], **options) -> dict:
         """`options` (e.g. temperature) go to the provider only when given."""
         start = time.perf_counter()
+        hub, invalid = self.ctx.hub, None
         try:
             answer = self.ctx.provider.complete_json(role, system, messages, **options)
         except InvalidAnswer as exc:  # the model answered, but not in JSON: as if it had said nothing
             self.send(SYSTEM, "error", {"role": role, "error": str(exc)})
-            answer = {}
+            answer, invalid = {}, exc
         except Exception as exc:
             self.send(SYSTEM, "error", {"role": role, "error": str(exc)})
+            if hub:
+                hub.on_llm_call(self.name, role, system, messages, None, None, round((time.perf_counter() - start) * 1000), exc)
             raise
+        duration_ms = round((time.perf_counter() - start) * 1000)
+        usage = getattr(self.ctx.provider, "last_usage", {})
         self.send("llm", "llm_call", {
             "role": role,
             "provider": getattr(self.ctx.provider, "name", "?"),
-            "duration_ms": round((time.perf_counter() - start) * 1000),
-            **getattr(self.ctx.provider, "last_usage", {}),
+            "duration_ms": duration_ms,
+            **usage,
         })
+        if hub:
+            hub.on_llm_call(self.name, role, system, messages, answer, usage, duration_ms, invalid)
         return shape(role, answer)
