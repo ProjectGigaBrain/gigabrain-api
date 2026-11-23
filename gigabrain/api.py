@@ -109,6 +109,15 @@ class ApproveDrafts(BaseModel):
     draft_ids: list[str] | None = Field(None, description="Which drafts to approve (e.g. [\"D1\", \"D3\"]). Null: all pending.")
 
 
+class RejectDraft(BaseModel):
+    reason: str | None = Field(None, max_length=2000, description="Why the PO rejects it (optional). It is kept in the memory.")
+
+
+class CloseConversation(BaseModel):
+    reason: str | None = Field(None, max_length=2000, description="Why the PO leaves with drafts not approved, if they "
+                                                                  "want to say (optional). It is kept in the memory.")
+
+
 class BehindTheScenes(BaseModel):
     id: int
     timestamp: str
@@ -209,7 +218,8 @@ def _expert_consultations(events: list[dict]) -> dict[str, int]:
 # ---------------------------------------------------------------------------- application
 
 def create_app(data_folder: str, create_provider: Callable[..., object], origins: list[str] | None = None,
-               token: str | None = None, validation=True) -> FastAPI:
+               token: str | None = None, validation=True, hub=None) -> FastAPI:
+    """`hub`: settings of the connection to the memory and traceability service (hub/), or None to run without it."""
     active: dict[str, ActiveConversation] = {}
     active_lock = threading.Lock()
 
@@ -218,6 +228,9 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
         yield
         for key in list(active):  # on shutdown, close the connections of open conversations
             finish(key)
+        if hub is not None:  # what was queued for the service still goes
+            from .hub import flush_all
+            flush_all()
 
     app = FastAPI(lifespan=lifespan, title="GigaBrain API", version="1.1.0",
                   description="Conversation of the PO with the Digital Twin and history of the Requirements Repository.")
@@ -268,7 +281,7 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
         if conversation["status"] == "closed" or conversation["mode"] not in CONVERSATION_MODES:
             raise HTTPException(409, "This conversation is closed. Open a new one.")
         council = Council.resume(open_context(folder, provider_for(x_llm_key), mode=conversation["mode"],
-                                              validation=validation), conversation_id)
+                                              validation=validation, hub=hub), conversation_id)
         with active_lock:
             session = active.setdefault(key, ActiveConversation(council, key))
         return session
@@ -330,6 +343,7 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
                     raise HTTPException(422, f"{upload.filename}: no text could be read (a scanned PDF?).")
                 files.append((upload.filename or "file", content))
             text = documents.with_attachments(text, files)
+            request.state.attachments = files  # (name, text) of each file: the memory keeps them too
         else:
             try:
                 text = NewMessage.model_validate(await request.json()).text
@@ -390,7 +404,8 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
         """Open a conversation of the PO with the Digital Twin. The optional X-LLM-Key header carries the
         provider key for this conversation only (it is never stored); without it the server's own key is used."""
         data = data or NewConversation()
-        council = Council(open_context(folder_of(project_id), provider_for(x_llm_key), mode=data.mode, validation=validation))
+        council = Council(open_context(folder_of(project_id), provider_for(x_llm_key), mode=data.mode, validation=validation,
+                                       hub=hub))
         conversation_id = council.start()
         title = (data.title or "").strip() or None
         if title:
@@ -412,7 +427,8 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
         Writing "approved" approves every pending draft."""
         text = await read_message(request)
         session = get_active(project_id, conversation_id, x_llm_key)
-        return await run_in_threadpool(run, session, lambda: session.council.talk(text))
+        files = getattr(request.state, "attachments", None)
+        return await run_in_threadpool(run, session, lambda: session.council.talk(text, files))
 
     @app.post("/api/v1/projects/{project_id}/conversations/{conversation_id}/meeting", tags=["conversation"], response_model=TwinAnswer,
               dependencies=protected)
@@ -446,12 +462,12 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
         """Approve one draft; the others stay as they are."""
         return approve(project_id, conversation_id, ApproveDrafts(draft_ids=[draft_id]), x_llm_key)
 
-    def change_draft(project_id: str, conversation_id: str, draft_id: str, x_llm_key: str | None, change: str) -> dict:
+    def change_draft(project_id: str, conversation_id: str, draft_id: str, x_llm_key: str | None, change: str, *extra) -> dict:
         session = get_active(project_id, conversation_id, x_llm_key)
 
         def work() -> dict:
             try:
-                getattr(session.council, change)(draft_id)
+                getattr(session.council, change)(draft_id, *extra)
             except KeyError as exc:
                 raise HTTPException(404, f"Draft {draft_id} not found.") from exc
             except ValueError as exc:
@@ -462,9 +478,11 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
 
     @app.delete("/api/v1/projects/{project_id}/conversations/{conversation_id}/drafts/{draft_id}", tags=["conversation"],
                 response_model=TwinAnswer, dependencies=protected)
-    def reject_draft(project_id: str, conversation_id: str, draft_id: str, x_llm_key: str | None = Header(None)) -> dict:
-        """Reject one pending draft. It stays in the list as rejected and can be restored."""
-        return change_draft(project_id, conversation_id, draft_id, x_llm_key, "reject")
+    def reject_draft(project_id: str, conversation_id: str, draft_id: str, data: RejectDraft | None = None,
+                     x_llm_key: str | None = Header(None)) -> dict:
+        """Reject one pending draft. It stays in the list as rejected and can be restored.
+        An optional body {"reason": "..."} says why; it is kept in the memory."""
+        return change_draft(project_id, conversation_id, draft_id, x_llm_key, "reject", (data.reason if data else None))
 
     @app.post("/api/v1/projects/{project_id}/conversations/{conversation_id}/drafts/{draft_id}/restore", tags=["conversation"],
               response_model=TwinAnswer, dependencies=protected)
@@ -482,11 +500,13 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
         return {**db.get_conversation(conversation_id), "active": f"{project_id}:{conversation_id}" in active}
 
     @app.post("/api/v1/projects/{project_id}/conversations/{conversation_id}/close", tags=["conversation"], dependencies=protected)
-    def close(project_id: str, conversation_id: str, x_llm_key: str | None = Header(None)) -> dict:
-        """Close the conversation: it keeps its history and stops accepting messages."""
+    def close(project_id: str, conversation_id: str, data: CloseConversation | None = None,
+              x_llm_key: str | None = Header(None)) -> dict:
+        """Close the conversation: it keeps its history and stops accepting messages.
+        An optional body {"reason": "..."} says why drafts were left unapproved; it is kept in the memory."""
         session = get_active(project_id, conversation_id, x_llm_key)
         with session.lock:
-            session.council.end("closed")
+            session.council.end("closed", ((data.reason or "").strip() or None) if data else None)
         finish(session.key)
         return {"id": conversation_id, "status": "closed", "active": False}
 

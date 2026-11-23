@@ -67,6 +67,10 @@ KINDS = {
     "language_retry": "Twin -> System. {text}: its answer was not in the language of the PO, so it is asked once more",
     "language_off": "Twin -> System. {text}: asked again, the answer is still not in that language",
     "epics_organized": "Twin -> Repository. {text, epics: [{id, title, requirements}]}: the requirements grouped into epics",
+    "memory_briefing": "Memory -> Twin. {records}: the latest decisions of the project, handed over when a conversation opens",
+    "memory_recall": "Memory -> Expert. {query, records}: what the memory had about a question (documents and past decisions)",
+    "memory_saved": "Twin -> Memory. {key, type, text}: a decision written in the memory",
+    "memory_facts": "Memory -> Twin. {query, facts}: what the Twin remembers about the PO and the project (Mem0)",
     "llm_call": "Agent -> LLM. {role, duration_ms, tokens?}",
     "error": "Any -> System. {error}",
 }

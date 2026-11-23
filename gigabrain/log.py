@@ -37,6 +37,12 @@ def summary(msg) -> str:
         return f"{c.get('expert_id')} v{c.get('version')}: {c.get('motive')}"
     if msg.kind == "llm_call":
         return f"{c.get('role')} in {c.get('duration_ms')} ms"
+    if msg.kind in ("memory_briefing", "memory_recall"):
+        return f"{len(c.get('records') or [])} record(s) from the memory"
+    if msg.kind == "memory_facts":
+        return f"{len(c.get('facts') or [])} fact(s) about the PO"
+    if msg.kind == "memory_saved":
+        return f"{c.get('type')}: {c.get('key')}"
     if msg.kind == "requirement_saved":
         return f"{c.get('requirement_id')} v{c.get('version')}" + (f" · decided by {c['decided_by']}" if c.get("decided_by") else "")
     for key in ("text", "question", "summary", "answer", "motive", "error"):
@@ -51,6 +57,7 @@ class Recorder:
         self.db = db
         self.logs_folder = logs_folder
         self.show_agents = show_agents
+        self.hub = None  # set by open_context when the connection to the service is on: every message is traced too
         os.makedirs(logs_folder, exist_ok=True)
 
     def record(self, msg: Message) -> Message:
@@ -60,4 +67,6 @@ class Recorder:
             f.write(msg.to_json() + "\n")
         if self.show_agents and msg.kind not in ("po_request", "approval"):
             print(f"  {_color(msg.sender)}[{msg.sender} → {msg.recipient}]{RESET} {msg.kind}: {summary(msg)}")
+        if self.hub is not None:
+            self.hub.on_message(msg)
         return msg

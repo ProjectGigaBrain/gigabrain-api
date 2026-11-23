@@ -11,6 +11,7 @@ Modules, in a good reading order:
 - log.py                 records every message
 - agents/                Digital Twin, Leader, Experts and the Critic
 - validation/            what the Critic scores with: the checks, the gate and the report (no LLM)
+- hub/                   optional connection to the memory and traceability service (off unless --hub)
 - council.py             a whole conversation with the PO
 - meeting.py             a meeting processed one utterance at a time
 - api.py                 REST API for the web application

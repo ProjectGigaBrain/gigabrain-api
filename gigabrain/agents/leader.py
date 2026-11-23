@@ -90,6 +90,8 @@ class Leader(Agent):
         if without_expert:
             consolidated["questions_for_po"].append(phrase("no_expert_yet", language, topics=", ".join(without_expert)))
         consolidated["sources"] = [{"kind": "expert", "ref": a["expert_id"], "version": a["knowledge_version"]} for a in answers]
+        for ref in dict.fromkeys(ref for a in answers for ref in a.get("memory_refs", [])):
+            consolidated["sources"].append({"kind": "memory", "ref": ref})  # what the memory had, next to the experts'
         self.send(TWIN, "consolidated_answer", consolidated)
         return consolidated
 

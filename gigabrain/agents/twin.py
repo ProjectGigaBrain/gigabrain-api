@@ -226,6 +226,24 @@ NOTHING_TO_SAY = "I could not work out an answer. Could you say that again?"
 CONTEXT_UTTERANCES = 6
 SAVED_IN_PROMPT = 30
 
+# Added to the Twin's prompt when the memory is on (never in the evaluation), so that a run without it is exactly the
+# run it was before. The note is there from the first call even if the project has no past yet: the history of a
+# conversation is sent again at each message, and its prompt must not change in the middle.
+MEMORY_NOTE = """
+You also have a memory of this project, kept by the memory service. It comes in two kinds:
+- "memory", in the first PO message: records of earlier conversations, newest first. Each has a ref, a date and its
+  text: a requirement the PO approved (with the reason and what changed from the version before), a draft the PO
+  rejected, changed or left unapproved and why, or a summary of a conversation. They are the record of what was
+  decided: when one speaks of a decision, it is right.
+- "po_memory", in any PO message: short facts about the PO and the project from earlier conversations (preferences,
+  context, how the PO works), best first, each with a ref and a score. They are looser than the records: use them to
+  know the context and to talk the way the PO likes. When a fact seems out of date or contradicts a record, trust the
+  record and ask the PO.
+Use both to pick up where the PO left off, and not to propose again, without saying so, what the PO already refused.
+When it matters, tell the PO what you remember and cite the ref or the requirement id, so that the PO can check it.
+Memory is context, not a source: never turn it into a requirement the PO did not ask for in this conversation.
+"""
+
 
 class DigitalTwin(Agent):
     name = TWIN
@@ -234,6 +252,8 @@ class DigitalTwin(Agent):
         super().__init__(ctx)
         self.history: list[dict] = []
         self.language: str | None = None  # the PO's, as far as the code can tell (language.py)
+        self.briefing: list[dict] | None = None  # what the memory handed over when the conversation opened (council.py)
+        self.memory_note = False  # the memory is on: the prompt tells the Twin what it may receive from it
 
     # ------------------------------------------------------------------ conversation with the PO
 
@@ -250,8 +270,10 @@ class DigitalTwin(Agent):
         """Take one message and decide the next action, without telling anyone yet."""
         if self.language:
             data = {**data, "language": self.language}
+        if self.briefing and not self.history:
+            data = {**data, "memory": self.briefing}
         self.history.append({"role": "user", "content": as_json(data)})
-        decision = self.call_llm("twin", SYSTEM_PROMPT, self.history)
+        decision = self.call_llm("twin", SYSTEM_PROMPT + (MEMORY_NOTE if self.memory_note else ""), self.history)
         decision["requirements"] = decision.get("requirements") or []
         if decision.get("action") not in ("ask", "consult", "propose"):
             decision["action"] = "ask"
@@ -288,10 +310,12 @@ class DigitalTwin(Agent):
         else:
             self.send(PO, "question_to_po", {"text": decision.get("message_to_po", "")})
 
-    def hear_po(self, text: str, drafts: list[dict] | None = None) -> dict:
-        """`drafts`: the requirements of the conversation the PO has not approved yet."""
+    def hear_po(self, text: str, drafts: list[dict] | None = None, memory: list[dict] | None = None) -> dict:
+        """`drafts`: the requirements of the conversation the PO has not approved yet.
+        `memory`: facts about the PO and the project the Twin remembers that fit this message (Mem0)."""
         self.language = spoken_language(text) or self.language  # a short "yes" keeps the language of the conversation
-        return self._decide({"from": "po", "text": text, **({"drafts": drafts} if drafts else {})})
+        return self._decide({"from": "po", "text": text, **({"drafts": drafts} if drafts else {}),
+                             **({"po_memory": memory} if memory else {})})
 
     def hear_leader(self, consolidated_answer: dict) -> dict:
         return self._decide({"from": "leader", "consolidated_answer": consolidated_answer})
