@@ -18,6 +18,7 @@ a declared origin instead of believing it.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from .. import knowledge
 from ..database import EVOLUTION_LINKS, Database
@@ -108,10 +109,16 @@ def proposal_ids(db: Database, requirements: list[dict]) -> dict[str, str]:
 
     The Twin does not know P1, and writes R3 for the requirement it proposes just before: once
     saved, that link is right. A new version of an existing requirement takes no new id.
+
+    The PO's working list names its requirements D1, D2..., and the Twin links to them by that name
+    (it has no other for what is not saved yet). A requirement that revises D1 is what a link to D1
+    means, so {"D1": "P1"} too.
     """
     number = int(db._next_requirement_id()[1:])
     ids: dict[str, str] = {}
     for position, requirement in enumerate(requirements, start=1):
+        if isinstance(requirement.get("draft_id"), str) and requirement["draft_id"]:
+            ids[requirement["draft_id"]] = f"P{position}"
         if not (requirement.get("base") and db.get_requirement(requirement["base"])):
             ids[f"R{number}"] = f"P{position}"
             number += 1
@@ -413,11 +420,31 @@ def validation_of(db: Database, requirement_id: str, *, engine=None) -> dict | N
 # --------------------------------------------------------------------------
 
 
-class RepositoryTraceability:
-    """TraceabilityProvider over the Requirements Repository (read only)."""
+def pending_drafts(db: Database, conversation_id: str | None) -> set[str]:
+    """The drafts (D1, D2...) the PO has not decided on, by the last board of the conversation."""
+    if not conversation_id:
+        return set()
+    row = db.con.execute("SELECT content FROM event WHERE kind = 'draft_board' AND conversation_id = ? ORDER BY id DESC LIMIT 1",
+                         (conversation_id,)).fetchone()
+    if not row:
+        return set()
+    return {d["draft_id"] for d in json.loads(row[0]).get("drafts") or [] if d.get("status") == "pending" and d.get("draft_id")}
 
-    def __init__(self, db: Database) -> None:
+
+class RepositoryTraceability:
+    """TraceabilityProvider over the Requirements Repository (read only).
+
+    `drafts` says which drafts of the conversation are pending (see `pending_drafts`): a draft is not in
+    the repository yet, but a link to it is a real relation, not a made-up id. It is not part of the port;
+    a check that wants it asks with `getattr(trace, "is_draft", None)`.
+    """
+
+    def __init__(self, db: Database, drafts: Callable[[], set[str]] | None = None) -> None:
         self.db = db
+        self._drafts = drafts
+
+    def is_draft(self, requirement_id: str) -> bool:
+        return bool(self._drafts) and requirement_id in self._drafts()
 
     def knows(self, requirement_id: str) -> bool:
         return self.db.get_requirement(requirement_id) is not None

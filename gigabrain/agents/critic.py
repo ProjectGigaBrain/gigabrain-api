@@ -75,6 +75,14 @@ FOR_THE_TWIN = (
     "PO, without mentioning this return or the corrections."
 )
 
+# Told to the Twin when only part of its proposal passed. Without it the Twin asks the PO about the part that did not,
+# writes as if all of it had been applied ("D1 updated") and, before this note existed, the part that passed was lost.
+KEPT_IF_ASKING = (
+    "\n\nPassed validation: {passed}. If you ask the PO instead of proposing again, these stay as proposed "
+    "and nothing else does: in \"message_to_po\" say only about them that they were changed, and never say "
+    "that another requirement was changed, added or fixed."
+)
+
 
 @dataclass
 class ValidationSettings:
@@ -124,7 +132,9 @@ class Critic(Agent):
         #: The judge goes through call_llm, so its calls are in the log like any agent's.
         self.judge = LLMJudge(self.call_llm, name=getattr(ctx.provider, "name", "llm")) if self.settings.judge else None
         self.engine = ValidationEngine(config=self.settings.config, policy=self.settings.policy,
-                                       trace=host.RepositoryTraceability(ctx.db), judge=self.judge)
+                                       trace=host.RepositoryTraceability(
+                                           ctx.db, drafts=lambda: host.pending_drafts(ctx.db, ctx.conversation_id)),
+                                       judge=self.judge)
 
     # ------------------------------------------------------------------ assessment
 
@@ -219,6 +229,7 @@ class Critic(Agent):
 
     def _gate_proposal(self, twin, latest: list[dict], rework) -> dict:
         rounds, unchanged = 0, False
+        left_out: list[str] = []
         while True:
             decision = latest[0]
             candidates, sources = self._proposal_artifacts(decision["requirements"])
@@ -226,12 +237,25 @@ class Critic(Agent):
             if report.passed or rounds >= self._rounds():
                 break
             rounds += 1
+            passed = self._passed(report, candidates)
             feedback = to_agent_feedback(report) + FOR_THE_TWIN
+            if passed and len(passed) < len(candidates):
+                feedback += KEPT_IF_ASKING.format(passed=", ".join(
+                    f"{candidates[n].id} ({decision['requirements'][n]['draft_id']})" if decision["requirements"][n].get("draft_id")
+                    else candidates[n].id for n in passed))
             self._return(twin.name, "proposal", report, rounds, feedback, returned=decision["requirements"])
             revised = rework({"from": "system", "notice": feedback})
             latest[0] = revised
             if revised["action"] != "propose":
-                return revised
+                if revised["action"] != "ask" or not passed or len(passed) == len(candidates):
+                    return revised
+                # The Twin asks the PO about what did not pass. What did pass stays proposed: dropping it would
+                # leave the PO reading "D1 updated" about a draft that did not change.
+                left_out = [c.id for n, c in enumerate(candidates) if n not in passed]
+                kept = [decision["requirements"][n] for n in passed]
+                latest[0] = {**revised, "action": "propose", "requirements": kept}
+                candidates, sources = self._proposal_artifacts(kept)
+                break
             if _fingerprint(self._proposal_artifacts(revised["requirements"])[0]) == _fingerprint(candidates):
                 unchanged = True
                 break
@@ -242,7 +266,26 @@ class Critic(Agent):
             requirement["validation"] = self._item_summary(together, artifact.id, rounds=rounds)
         decision["validation"] = {**to_summary(together), "rounds": rounds, "unchanged": unchanged,
                                   "feedback": None if together.passed else to_agent_feedback(together)}
+        if left_out:
+            decision["validation"]["left_out"] = left_out  # returned, and the Twin asked the PO about them instead
         return decision
+
+    @staticmethod
+    def _passed(report: ValidationReport, candidates: list[Artifact]) -> list[int]:
+        """The positions of the candidates that passed on their own and do not link to one that did not.
+
+        Empty when no candidate failed individually: then the report failed for something that is nobody's in particular.
+        """
+        failed = {i.artifact_id for i in report.item_results if not i.passed}
+        if not failed:
+            return []
+        kept = [n for n, c in enumerate(candidates) if c.id not in failed]
+        while True:
+            gone = {c.id for n, c in enumerate(candidates) if n not in kept}
+            linked = [n for n in kept if any(link.target in gone for link in candidates[n].links)]
+            if not linked:
+                return kept
+            kept = [n for n in kept if n not in linked]
 
     # ------------------------------------------------------------------ meeting in batch
 

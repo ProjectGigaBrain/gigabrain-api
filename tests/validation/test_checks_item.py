@@ -458,7 +458,29 @@ class _Repository:
         return []
 
 
+class _RepositoryWithDrafts(_Repository):
+    """The same, and the PO's working list has some drafts (D1, D2...) that are not saved."""
+
+    def __init__(self, *known, drafts=()):
+        super().__init__(*known)
+        self.drafts = set(drafts)
+
+    def is_draft(self, requirement_id):
+        return requirement_id in self.drafts
+
+
 class TestLinks(ItemCheckCase):
+    def test_a_link_to_a_draft_the_po_has_not_approved_is_a_real_relation(self):
+        art = artifact(links=[LinkRef("depends_on", "D1")])
+        findings = self.findings_for(art, trace=_RepositoryWithDrafts("R7", drafts=["D1"]))
+        self.assertEqual(self.severities(findings, "grounding.links_resolvable"), [Severity.INFO])
+        self.assertIn("a draft the PO has not approved yet", next(f.message for f in findings if f.check_id == "grounding.links_resolvable"))
+
+    def test_a_link_to_a_draft_that_is_not_on_the_list_is_still_a_defect(self):
+        art = artifact(links=[LinkRef("depends_on", "D9")])
+        findings = self.findings_for(art, trace=_RepositoryWithDrafts("R7", drafts=["D1"]))
+        self.assertEqual(self.severities(findings, "grounding.links_resolvable"), [Severity.MAJOR])
+
     def test_link_to_a_requirement_of_the_run(self):
         art = artifact("R2", links=[LinkRef("refines", "R1")])
         self.assertNotIn("grounding.links_resolvable", check_ids(self.findings_for(art, artifact("R1"))))
