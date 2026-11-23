@@ -328,6 +328,14 @@ def links_resolvable(artifact: Artifact, ctx: CheckContext) -> Iterable[Finding]
         if no_provider:
             unknown.append(f"{link.kind} {link.target}")
             continue
+        is_draft = getattr(ctx.trace, "is_draft", None)
+        if is_draft is not None and is_draft(link.target):
+            # D1 is on the PO's list, not in the repository: the relation is real, the id is the one the PO sees.
+            yield finding(Severity.INFO, locator, link.target,
+                          f"The link points to {link.target}, a draft the PO has not approved yet.",
+                          "Keep it: it records a real relation. The repository only keeps links between saved "
+                          "requirements, so record it again once both are saved.")
+            continue
         yield finding(Severity.MAJOR, locator, link.target,
                       f"The artefact declares '{link.kind} {link.target}', and {link.target} does not exist.",
                       "Link to a requirement that exists. The repository drops this link without saying so.")

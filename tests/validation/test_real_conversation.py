@@ -99,6 +99,14 @@ class TestIdsOfTheSameProposal(Flow):
         _, ids = self.ids([{"statement": "a", "base": "R9"}], saved=1)
         self.assertEqual(ids, {"R2": "P1"})
 
+    def test_a_requirement_that_revises_a_draft_is_what_a_link_to_the_draft_means(self):
+        _, ids = self.ids([{"statement": "a", "draft_id": "D1"}, {"statement": "b"}], saved=0)
+        self.assertEqual(ids, {"D1": "P1", "R1": "P1", "R2": "P2"})
+
+    def test_a_revision_of_a_draft_that_is_a_new_version_takes_no_new_id(self):
+        _, ids = self.ids([{"statement": "a", "base": "R1", "draft_id": "D2"}], saved=1)
+        self.assertEqual(ids, {"D2": "P1"})
+
     def test_only_links_to_those_ids_change(self):
         requirement = {"statement": "a", "links": [{"kind": "depends_on", "target": "R1"}, {"kind": "refines", "target": "R9"}, "x"]}
         changed = host.with_run_links(requirement, {"R1": "P1"})
@@ -114,6 +122,49 @@ class TestIdsOfTheSameProposal(Flow):
         candidates, sources = ctx.critic._proposal_artifacts(requirements)
         report = ctx.critic.engine.validate(host.Envelope(artifacts=candidates, sources=sources), focus={c.id for c in candidates}, document_level=False)
         return [f for f in report.all_findings() if f.check_id == "grounding.links_resolvable"]
+
+    def draft_link(self, target: str, *, board: list[dict] | None, revises: str | None = "D1"):
+        """P1 revises `revises` (D1); P2 links to `target`; `board` is the last list of drafts of the conversation."""
+        ctx = self.context("data")
+        ctx.conversation_id = ctx.db.start_conversation("after_meeting")
+        if board is not None:
+            ctx.db.record_event(host.Message(sender="twin", recipient="po", kind="draft_board", content={"drafts": board},
+                                             conversation_id=ctx.conversation_id))
+        requirements = [{"title": "Login with email and password", "statement": "The system shall require an email and a password at login.",
+                         **({"draft_id": revises} if revises else {})},
+                        {"title": "Block login", "statement": "The system shall block the login after repeated failed attempts.",
+                         "links": [{"kind": "depends_on", "target": target}]}]
+        candidates, sources = ctx.critic._proposal_artifacts(requirements)
+        report = ctx.critic.engine.validate(host.Envelope(artifacts=candidates, sources=sources), focus={c.id for c in candidates}, document_level=False)
+        return [f for f in report.all_findings() if f.check_id == "grounding.links_resolvable"]
+
+    def test_a_link_to_the_draft_the_same_proposal_revises_is_a_link_inside_the_run(self):
+        # What happened with a real LLM: the Twin said "depends_on D1" while revising D1 in the same proposal.
+        found = self.draft_link("D1", board=[{"draft_id": "D1", "status": "pending"}])
+        self.assertEqual([f.severity for f in found], [Severity.INFO])
+        self.assertIn("P1", found[0].message)
+
+    def test_a_link_to_a_pending_draft_outside_the_proposal_is_not_a_made_up_id(self):
+        found = self.draft_link("D2", board=[{"draft_id": "D1", "status": "pending"}, {"draft_id": "D2", "status": "pending"}], revises=None)
+        self.assertEqual([f.severity for f in found], [Severity.INFO])
+        self.assertIn("a draft the PO has not approved yet", found[0].message)
+
+    def test_a_link_to_a_draft_the_po_already_decided_is_a_defect(self):
+        found = self.draft_link("D2", board=[{"draft_id": "D2", "status": "rejected"}], revises=None)
+        self.assertEqual([f.severity for f in found], [Severity.MAJOR])
+
+    def test_a_link_to_a_draft_that_was_never_there_is_a_defect(self):
+        self.assertEqual([f.severity for f in self.draft_link("D7", board=None, revises=None)], [Severity.MAJOR])
+        self.assertEqual([f.severity for f in self.draft_link("D7", board=[{"draft_id": "D1", "status": "pending"}], revises=None)], [Severity.MAJOR])
+
+    def test_the_last_board_is_the_one_that_counts(self):
+        ctx = self.context("data")
+        ctx.conversation_id = ctx.db.start_conversation("after_meeting")
+        for drafts in ([{"draft_id": "D1", "status": "pending"}], [{"draft_id": "D1", "status": "approved"}, {"draft_id": "D2", "status": "pending"}]):
+            ctx.db.record_event(host.Message(sender="twin", recipient="po", kind="draft_board", content={"drafts": drafts},
+                                             conversation_id=ctx.conversation_id))
+        self.assertEqual(host.pending_drafts(ctx.db, ctx.conversation_id), {"D2"})
+        self.assertEqual(host.pending_drafts(ctx.db, None), set())
 
     def test_the_id_of_the_previous_requirement_is_a_link_inside_the_run(self):
         self.assertEqual([f.severity for f in self.proposal_with_link("R1")], [Severity.INFO])

@@ -37,6 +37,7 @@ from .flows import (
     TwinFixesDraft,
     TwinFixesProposal,
     TwinOverrules,
+    TwinProposesTwoThenAsks,
     events,
     project,
     validation_trail,
@@ -119,6 +120,52 @@ class TestProposalGate(Flow):
         self.assertNotIn("proposal", kinds)
         self.assertEqual(kinds[-1], "question_to_po")
         self.assertEqual(validation_trail(council.ctx), [("validation_report", "proposal", "twin"), ("validation_return", "proposal", "twin")])
+
+    def test_what_passed_stays_proposed_when_the_twin_asks_about_what_did_not(self):
+        provider = TwinProposesTwoThenAsks()
+        council = self.council(provider=provider)
+        answer = self.propose(council)
+
+        # The Twin asked, but its message says requirement 1 was changed: that has to be true.
+        self.assertEqual((answer["action"], answer["message_to_po"]), ("propose", TwinProposesTwoThenAsks.QUESTION))
+        self.assertEqual(len(answer["requirements"]), 1)
+        self.assertNotEqual(answer["requirements"][0]["title"], "Block login after failed attempts")
+        self.assertEqual(answer["validation"]["left_out"], ["P2"])
+        self.assertEqual(answer["requirements"][0]["validation"]["passed"], True)
+        # It is a draft the PO can approve; the one asked about is not.
+        self.assertEqual([(d["draft_id"], d["status"]) for d in council.drafts], [("D1", "pending")])
+        # The Twin was told which part stays, so that it does not claim more.
+        self.assertIn("Passed validation: P1", provider.notice)
+        self.assertIn("never say that another requirement was changed", provider.notice)
+        self.assertEqual([e["kind"] for e in events(council.ctx)][-3:], ["validation_report", "proposal", "draft_board"])
+
+    def test_the_twin_is_not_told_what_stays_when_everything_failed_or_everything_passed(self):
+        provider = TwinFixesProposal()
+        council = self.council(provider=provider)
+        self.propose(council)
+        self.assertNotIn("Passed validation", provider.notice)  # the only item failed
+
+    def test_a_proposal_that_failed_as_a_whole_is_still_only_a_question(self):
+        # The existing behaviour when nothing passed: the question stands and nothing is proposed.
+        council = self.council(provider=TwinAsksInstead())
+        answer = self.propose(council)
+        self.assertEqual(answer["action"], "ask")
+        self.assertEqual(council.drafts, [])
+
+    def test_a_requirement_that_links_to_the_one_asked_about_does_not_stay(self):
+        from gigabrain.agents.critic import Critic
+        council = self.council()
+        passing, failing = council.ctx.critic._proposal_artifacts(
+            [{"statement": "The system shall record each login.", "title": "Record logins"},
+             {"statement": "The system shall block the login after repeated failures.", "title": "Block"}])[0]
+        report = type("Report", (), {"item_results": [type("Item", (), {"artifact_id": "P2", "passed": False})(),
+                                                     type("Item", (), {"artifact_id": "P1", "passed": True})()]})()
+        self.assertEqual(Critic._passed(report, [passing, failing]), [0])
+        from gigabrain.validation.model import LinkRef
+        passing.links.append(LinkRef("depends_on", "P2"))
+        self.assertEqual(Critic._passed(report, [passing, failing]), [])
+        report.item_results = [type("Item", (), {"artifact_id": "P1", "passed": True})()]
+        self.assertEqual(Critic._passed(report, [passing, failing]), [])  # nobody failed: nobody is singled out
 
     def test_with_no_rounds_the_proposal_is_scored_and_never_returned(self):
         council = self.council(validation=ValidationSettings(rounds=0))

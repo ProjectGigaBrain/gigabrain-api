@@ -9,6 +9,7 @@ it is. No test calls an LLM.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -98,6 +99,18 @@ def _last(messages: list[dict]) -> dict:
     return json.loads(messages[-1]["content"])
 
 
+def _passable(requirement: dict) -> dict:
+    """The simulated proposal with a concrete role and two criteria that can be observed: it passes validation."""
+    requirement["story"]["role"] = "customer"
+    requirement["acceptance_criteria"] = [
+        {"scenario": "Confirmed", "given": "an order waiting for payment", "when": "the payment is confirmed",
+         "then": "the system sends an email to the customer within 1 minute"},
+        {"scenario": "Declined", "given": "an order waiting for payment", "when": "the payment is declined",
+         "then": "the system sends no confirmation email"},
+    ]
+    return requirement
+
+
 class TwinFixesProposal(SimulatedProvider):
     """The Twin fixes a proposal the Critic returned: a concrete role and two criteria that can be observed."""
 
@@ -107,14 +120,30 @@ class TwinFixesProposal(SimulatedProvider):
             return super()._twin(messages)
         self.notice = last["notice"]
         answer = super()._twin(messages[:-1])  # what it had proposed, to be fixed
-        requirement = answer["requirements"][0]
-        requirement["story"]["role"] = "customer"
-        requirement["acceptance_criteria"] = [
-            {"scenario": "Confirmed", "given": "an order waiting for payment", "when": "the payment is confirmed",
-             "then": "the system sends an email to the customer within 1 minute"},
-            {"scenario": "Declined", "given": "an order waiting for payment", "when": "the payment is declined",
-             "then": "the system sends no confirmation email"},
-        ]
+        _passable(answer["requirements"][0])
+        return answer
+
+
+class TwinProposesTwoThenAsks(SimulatedProvider):
+    """The Twin proposes two requirements, one that passes and one that does not, and answers the return by asking.
+
+    The second one is the kind of thing a PO has not said (how many attempts, for how long), so asking is right;
+    the first one is a change the PO did ask for.
+    """
+
+    QUESTION = "Requirement 1 is changed. How many failed attempts block the login, and for how long?"
+
+    def _twin(self, messages):
+        last = _last(messages)
+        if last.get("from") == "system":
+            self.notice = last["notice"]
+            return {"action": "ask", "message_to_po": self.QUESTION, "query": None, "requirements": []}
+        answer = super()._twin(messages)
+        if answer["action"] == "propose":
+            failing = answer["requirements"][0]
+            passing = _passable(copy.deepcopy(failing))
+            failing["title"], failing["statement"] = "Block login after failed attempts", "The system shall block the login after repeated failed attempts."
+            answer["requirements"] = [passing, failing]
         return answer
 
 
