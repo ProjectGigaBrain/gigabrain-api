@@ -220,11 +220,51 @@ to guide your vote: fix what it points out when the utterances allow it, and dis
 whose origin could not be confirmed.
 """
 
+# After a whole meeting: the decisions of the meeting against what the Repository already holds.
+RECONCILE_PROMPT = """\
+You are the Digital Twin of GigaBrain. You have just read ONE meeting of the project, one
+utterance at a time, and saved its requirements. Meetings change earlier decisions: an idea is
+dropped, a component is cut for cost, a material is replaced, a rule gets another value. Each
+utterance was read on its own, so the Repository may still hold requirements that THIS meeting
+made obsolete. Now look at the meeting as a whole and say what happens to them.
+
+You receive "meeting" (the utterances, with their ids), "repository" (every requirement that still
+holds, oldest first, with "from_this_meeting") and "open_conflicts" (pairs linked with
+conflicts_with that nobody settled).
+
+For each requirement that a decision of this meeting changes, give ONE change:
+- "supersede": another requirement of the repository states the decision that takes its place.
+  Give its id in "by". The newer one wins: "by" must be more recent than "target".
+  Ex.: R50 "the LCD panel was removed for budget; replies are shown on the TV" supersedes R32
+  "the remote shall have a small LCD screen".
+- "revise": the requirement still holds, but part of it changed (another value, an element
+  removed). Give the whole corrected "statement", keeping the original words for what did not
+  change.
+- "withdraw": it no longer holds and nothing in the repository replaces it: an idea that was only
+  raised as a possibility ("we could", "competitors have", "maybe") and that this meeting set
+  aside or that a decision of this meeting makes impossible (a cost ceiling, the chosen material,
+  a removed component); an option that lost to another one.
+
+Rules:
+- Chronology: when two requirements contradict each other, the later decision prevails.
+- Evidence: every change cites in "turns" the utterance(s) of THIS meeting that justify it. No
+  utterance, no change. A requirement that is simply not mentioned again stays as it is.
+- One decision can make several requirements obsolete: one change per requirement.
+- Only ids of "repository" may be "target" or "by". At most one change per target.
+- An open conflict that this meeting settles: supersede the losing requirement.
+- When nothing changes, answer an empty list.
+LANGUAGE: write "statement" and "reason" in the language given in "language". Never translate.
+
+Answer with a single JSON object:
+{"changes": [{"action": "supersede" | "revise" | "withdraw", "target": "R5", "by": "R10" or null,
+  "statement": "only for revise", "reason": "short", "turns": ["T12"]}]}
+"""
+
 # What the PO reads when a model answer had nothing usable for the PO.
 NOTHING_TO_SAY = "I could not work out an answer. Could you say that again?"
 
 CONTEXT_UTTERANCES = 6
-SAVED_IN_PROMPT = 30
+SAVED_IN_PROMPT = 100
 
 
 class DigitalTwin(Agent):
@@ -356,6 +396,23 @@ class DigitalTwin(Agent):
                            "turns": [t for t in (raw.get("turns") or []) if isinstance(t, str)]})
         self.send(TWIN, "drafts", {"requirements": drafts})
         return drafts
+
+    def reconcile(self, turns: list[dict], repository: list[dict], open_conflicts: list[dict], language: str = "en") -> list[dict]:
+        """Read a whole meeting against the Repository and say which requirements it made obsolete.
+
+        Returns the changes as the model gave them; reconcile.py checks them before anything changes.
+        """
+        if not repository:
+            return []
+        answer = self.call_llm("twin_reconcile", RECONCILE_PROMPT, [{"role": "user", "content": as_json({
+            "language": language,
+            "meeting": [f"[{t['id']}] {t['speaker']}: {t['text']}" for t in turns],
+            "repository": repository,
+            "open_conflicts": open_conflicts,
+        })}])
+        changes = answer.get("changes") or []
+        self.send(TWIN, "reconciliation", {"changes": changes})
+        return changes
 
     def decide(self, draft: dict, recommendation: dict, utterances: dict[str, str], language: str = "en",
                guidance: dict | None = None) -> dict:

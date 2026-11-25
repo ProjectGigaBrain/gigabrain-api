@@ -6,6 +6,7 @@ Three separate databases, one file each in the data folder:
    - requirement:          the living requirement (id R1, R2..., status, current version)
    - requirement_version:  every approved version; old versions are never deleted
    - requirement_link:     links between requirements ("R2 refines R1")
+   - requirement_change:   status changes with no link behind them (a requirement withdrawn)
 2. Expert Registry  (experts.db)
    - expert:            which experts exist and which topic each one covers
    - expert_knowledge:  every version of each expert's knowledge file
@@ -45,6 +46,11 @@ STATUS_AFTER_LINK = {
     "merges": "merged",
 }
 
+# A requirement that no longer holds and that nothing replaces (an idea dropped, a feature cut).
+WITHDRAWN = "withdrawn"
+# The statuses of a requirement that still holds.
+LIVE_STATUSES = ("active", "under_review")
+
 # Links that tell where a requirement came from.
 EVOLUTION_LINKS = ("refines", "splits", "merges", "supersedes")
 
@@ -63,7 +69,7 @@ CREATE TABLE IF NOT EXISTS main.requirement (
     title            TEXT NOT NULL,
     kind             TEXT NOT NULL,      -- business | enabler
     topics           TEXT NOT NULL,      -- JSON: ["payments", ...]
-    status           TEXT NOT NULL,      -- active | under_review | superseded | split | merged
+    status           TEXT NOT NULL,      -- active | under_review | superseded | split | merged | withdrawn
     current_version  INTEGER NOT NULL,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
@@ -86,6 +92,17 @@ CREATE TABLE IF NOT EXISTS main.requirement_link (
     kind             TEXT NOT NULL,
     target_id        TEXT NOT NULL REFERENCES requirement(id),
     reason           TEXT,
+    conversation_id  TEXT,
+    created_at       TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS main.requirement_change (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    requirement_id   TEXT NOT NULL REFERENCES requirement(id),
+    status_before    TEXT NOT NULL,
+    status_after     TEXT NOT NULL,
+    reason           TEXT,
+    sources          TEXT NOT NULL,      -- JSON: utterances, conversation...
     conversation_id  TEXT,
     created_at       TEXT NOT NULL
 );
@@ -361,6 +378,38 @@ class Database:
         with self.con:
             return self._insert_link(source, kind, target, reason, conversation_id, now())
 
+    def withdraw(self, id_: str, reason: str | None = None, conversation_id: str | None = None,
+                 sources: list[dict] | None = None) -> dict | None:
+        """The requirement no longer holds and nothing replaces it (an idea dropped, a feature cut).
+
+        Only a requirement that still holds can be withdrawn. The old versions stay, and whoever
+        depended on it goes under review. Returns {"requirement_id", "status", "under_review"},
+        or None when there was nothing to withdraw.
+        """
+        row = self._one("SELECT status FROM requirement WHERE id = ?", (id_,))
+        if not row or row["status"] not in LIVE_STATUSES:
+            return None
+        ts = now()
+        with self.con:
+            self.con.execute("UPDATE requirement SET status = ?, updated_at = ? WHERE id = ?", (WITHDRAWN, ts, id_))
+            self.con.execute(
+                """INSERT INTO requirement_change (requirement_id, status_before, status_after, reason, sources, conversation_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (id_, row["status"], WITHDRAWN, reason, json.dumps(sources or [], ensure_ascii=False), conversation_id, ts),
+            )
+            under_review = self._mark_dependents(id_, ts)
+        return {"requirement_id": id_, "status": WITHDRAWN, "under_review": under_review}
+
+    def status_changes(self, requirement_id: str | None = None) -> list[dict]:
+        """The status changes with no link behind them (see withdraw)."""
+        sql, args = "SELECT * FROM requirement_change", ()
+        if requirement_id:
+            sql, args = sql + " WHERE requirement_id = ?", (requirement_id,)
+        rows = self._all(sql + " ORDER BY id", args)
+        for row in rows:
+            row["sources"] = json.loads(row["sources"])
+        return rows
+
     def _mark_dependents(self, requirement_id: str, ts: str, except_id: str | None = None) -> list[str]:
         """Set "under_review" on requirements that `depends_on` this one."""
         marked = []
@@ -391,7 +440,7 @@ class Database:
     def list_requirements(self, only_active: bool = False) -> list[dict]:
         sql = "SELECT * FROM requirement"
         if only_active:
-            sql += " WHERE status IN ('active', 'under_review')"
+            sql += f" WHERE status IN ({', '.join(repr(x) for x in LIVE_STATUSES)})"
         sql += " ORDER BY CAST(SUBSTR(id, 2) AS INTEGER)"
         return [self._build_requirement(row) for row in self._all(sql)]
 
@@ -434,6 +483,9 @@ class Database:
                 steps.append({"timestamp": link["created_at"], "requirement_id": current, "event": "link",
                               "kind": link["kind"], "target_id": link["target_id"], "reason": link["reason"]})
                 queue.append(link["target_id"])
+            for change in self.status_changes(current):
+                steps.append({"timestamp": change["created_at"], "requirement_id": current, "event": "status",
+                              "status": change["status_after"], "reason": change["reason"]})
         # Ties in the same second: older requirements (smaller id) first, and a
         # requirement's version before the links it created.
         return sorted(steps, key=lambda s: (s["timestamp"], int(s["requirement_id"][1:]), s["event"] != "version", s.get("version", 0)))

@@ -204,9 +204,33 @@ Each requirement has an id (R1, R2...), versions (none is ever deleted) and link
 | `merges` | was merged with others | becomes `merged` |
 | `supersedes` | takes its place | becomes `superseded` |
 | `depends_on` | needs it | if it changes, this one becomes `under_review` |
-| `conflicts_with` | contradicts it | the PO decides |
+| `conflicts_with` | contradicts it | the PO decides (or the later decision, after a meeting) |
 
 Read it as "source *link* target": "R3 supersedes R1".
+
+A requirement that no longer holds and that nothing replaces (an idea dropped, a feature cut
+for cost) is **withdrawn**: status `withdrawn`, with the reason and the utterances in its history
+(`python main.py trace R7`).
+
+### Reconciliation after each meeting
+
+A meeting is read one utterance at a time, so a decision taken later in the meeting (or in a
+later meeting) does not change what was saved before it: "the LCD panel was removed for budget"
+becomes a new requirement while "the remote has an LCD screen" stays active. At the end of each
+meeting the Twin reads the whole meeting against the Repository (`gigabrain/reconcile.py`) and,
+for each requirement a decision of the meeting made obsolete, proposes one change:
+
+| Change | When | Result |
+|---|---|---|
+| `supersede` | a newer requirement states the decision that replaced it | link `supersedes`, the old one becomes `superseded` |
+| `revise` | it still holds, but part of it changed | a new version |
+| `withdraw` | nothing replaces it: an idea set aside, a feature cut | `withdrawn` |
+
+The later decision prevails, and every change must cite utterances of the meeting; a change
+that names an unknown requirement, cites nothing or lets an older requirement replace a newer
+one is dropped. In a meeting processed in batch (evaluation) the Twin applies the changes, in
+`council` mode only; the evaluation then scores the final specification and lists what was
+retired in `retired`. In a conversation the changes become drafts for the PO to approve.
 
 ## Epics
 

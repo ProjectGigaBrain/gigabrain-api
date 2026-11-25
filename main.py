@@ -193,6 +193,8 @@ def cmd_trace(args) -> None:
     for step in ctx.db.trace(args.requirement):
         if step["event"] == "version":
             print(f"{step['timestamp']}  {step['requirement_id']} v{step['version']}  {step['title']}  ({step['reason']})")
+        elif step["event"] == "status":
+            print(f"{step['timestamp']}  {step['requirement_id']} {step['status']}  ({step['reason']})")
         else:
             print(f"{step['timestamp']}  {step['requirement_id']} {step['kind']} {step['target_id']}  ({step['reason']})")
 

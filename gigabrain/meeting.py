@@ -15,6 +15,8 @@
                                     Twin decides (final vote) ──▶ Requirements Repository
                                     the expert learns right away (notes the requirement)
       ──▶ next utterance
+    council only: the Twin reads the whole meeting against the Repository (reconcile.py) and
+                  supersedes, revises or withdraws what a later decision made obsolete
     ──▶ Critic scores the whole repository
 
 There is no PO in a meeting processed in batch: the Digital Twin, who represents the PO
@@ -32,9 +34,9 @@ from __future__ import annotations
 import json
 import os
 
-from . import evaluation, evaluation_meetings, requirement_format, scenarios
+from . import evaluation, evaluation_meetings, reconcile, requirement_format, scenarios
 from .agents import Context, DigitalTwin, Expert, Leader
-from .database import slug
+from .database import LIVE_STATUSES, slug
 from .messages import LEADER, REPOSITORY, SYSTEM, TWIN, Message
 
 MODES = ("council", "single_agent", "plain_llm")
@@ -136,10 +138,38 @@ def process(ctx: Context, project: dict, mode: str = "council") -> dict:
                 else:
                     keep(draft, {**draft, "save": True, "links": [], "motive": "drafted from the transcript"}, None)
 
+    # The meeting as a whole: what its later decisions made obsolete (council only; the baselines stay as they are).
+    reconciled = []
+    if mode == "council":
+        for change in reconcile.run(ctx, twin, project["turns"], language):
+            outcome = reconcile.apply(ctx, twin, change, utterances, language, DECIDED_BY[mode],
+                                      [{"kind": "turn", "ref": t, "project": project["id"]} for t in change["turns"]])
+            if outcome:
+                reconciled.append(outcome)
+        _refresh(ctx, predicted)
+
     # Everything together, at the end: the requirements of the repository as one specification.
     repository = critic.review_repository() if critic else None
     ctx.db.end_conversation(ctx.conversation_id, "approved")
-    return {"conversation_id": ctx.conversation_id, "predicted": predicted, "discarded": discarded, "validation": repository}
+    return {"conversation_id": ctx.conversation_id, "predicted": predicted, "discarded": discarded, "validation": repository,
+            "reconciled": reconciled}
+
+
+def _refresh(ctx: Context, predicted: list[dict]) -> None:
+    """Status and statement of each saved requirement as the Repository holds them now."""
+    for p in predicted:
+        req = ctx.db.get_requirement(p["id"])
+        if not req:
+            continue
+        p["status"] = req["status"]
+        if req["current_version"] > 1:
+            p["text"] = req["content"].get("statement") or p["text"]
+
+
+def _live(predicted: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(what still holds, what a later decision superseded or withdrew)."""
+    live = [p for p in predicted if p.get("status", "active") in LIVE_STATUSES]
+    return live, [p for p in predicted if p.get("status", "active") not in LIVE_STATUSES]
 
 
 def _process_meetings(ctx: Context, project: dict, mode: str) -> dict:
@@ -150,16 +180,18 @@ def _process_meetings(ctx: Context, project: dict, mode: str) -> dict:
     meetings = project.get("meetings") or []
     if len(meetings) <= 1 or mode == "plain_llm":
         return process(ctx, project, mode)
-    predicted, discarded, conversations, repository = [], [], [], None
+    predicted, discarded, conversations, repository, reconciled = [], [], [], None, []
     for k, m in enumerate(meetings, start=1):
         part = {**project, "title": f"{project['title']} (meeting {k}/{len(meetings)})", "turns": m["turns"]}
         r = process(ctx, part, mode)
         predicted += r["predicted"]
         discarded += r["discarded"]
+        reconciled += r["reconciled"]
         conversations.append(r["conversation_id"])
         repository = r["validation"]  # the repository as the last meeting left it
+    _refresh(ctx, predicted)  # a later meeting may have changed what an earlier one saved
     return {"conversation_id": conversations[-1], "conversations": conversations, "predicted": predicted,
-            "discarded": discarded, "validation": repository}
+            "discarded": discarded, "validation": repository, "reconciled": reconciled}
 
 
 def _structure_metrics(predicted: list[dict]) -> dict:
@@ -207,9 +239,12 @@ def _write(folder: str, report: dict) -> dict:
 
 def process_and_evaluate(ctx: Context, project: dict, output_folder: str, mode: str = "council") -> dict:
     result = _process_meetings(ctx, project, mode)
-    report = evaluation.evaluate(result["predicted"], project["gold"], project["turns"])
+    # What is evaluated is the final specification: what a later decision superseded or withdrew is out of it.
+    live, retired = _live(result["predicted"])
+    report = evaluation.evaluate(live, project["gold"], project["turns"])
     report.update({"scenario": "meeting", "conversation_id": result["conversation_id"],
-                   "predicted": result["predicted"], "discarded": result["discarded"], "validation": result["validation"]})
+                   "predicted": live, "retired": retired, "reconciled": result.get("reconciled", []),
+                   "discarded": result["discarded"], "validation": result["validation"]})
     if "conversations" in result:
         report["conversations"] = result["conversations"]
     return _write(output_folder, _report(ctx, project, mode, report))
@@ -217,16 +252,18 @@ def process_and_evaluate(ctx: Context, project: dict, output_folder: str, mode: 
 
 def process_sessions_and_evaluate(ctx: Context, project: dict, scenario: dict, output_folder: str, mode: str = "council") -> dict:
     """Several meetings in sequence over the SAME repository."""
-    predicted, discarded, conversations, repository = [], [], [], None
+    predicted, discarded, conversations, repository, reconciled = [], [], [], None, []
     n = len(scenario["sessions"])
     for k, session in enumerate(scenario["sessions"], start=1):
         part = {**project, "title": f"{project['title']} (session {k}/{n})", "turns": session["turns"]}
         r = process(ctx, part, mode)
         predicted += r["predicted"]
         discarded += r["discarded"]
+        reconciled += r["reconciled"]
         conversations.append(r["conversation_id"])
         repository = r["validation"]  # the repository as the last session left it
+    _refresh(ctx, predicted)
     report = scenarios.evaluate(ctx.db, project, scenario, predicted)
     report.update({"scenario": "sessions", "conversations": conversations, "predicted": predicted, "discarded": discarded,
-                   "validation": repository})
+                   "validation": repository, "reconciled": reconciled})
     return _write(output_folder, _report(ctx, project, mode, report))

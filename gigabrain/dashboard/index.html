@@ -429,7 +429,7 @@ const LINK_KIND = {
 const EVOLUTION = ["refines", "splits", "merges", "supersedes"];
 const STATUS = {
   active: { txt: "active", cls: "ok" }, under_review: { txt: "under review", cls: "warn" },
-  superseded: { txt: "superseded", cls: "" }, split: { txt: "split", cls: "" }, merged: { txt: "merged", cls: "" },
+  superseded: { txt: "superseded", cls: "" }, split: { txt: "split", cls: "" }, merged: { txt: "merged", cls: "" }, withdrawn: { txt: "withdrawn", cls: "" },
 };
 const statusBadge = (status) => { const s = STATUS[status] || { txt: status, cls: "" }; return `<span class="badge ${s.cls}">${s.txt}</span>`; };
 const classTxt = (x) => (x.class || "") + (x.subtype ? " · " + x.subtype : "");

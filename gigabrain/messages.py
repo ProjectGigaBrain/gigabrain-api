@@ -55,6 +55,9 @@ KINDS = {
     "requirement_under_review": "Repository -> Twin. {requirement_id, because_of}",
     "knowledge_updated": "Expert -> Registry. {expert_id, version, motive}",
     "decision": "Twin -> Twin. {draft, save, motive}: the final vote of the Deliberative Council",
+    "reconciliation": "Twin -> Twin. {changes}: what a whole meeting made obsolete in the Repository (reconcile.py)",
+    "requirement_reconciled": "Twin -> Repository. {action, target, by?, version?, reason, turns, decided_by}: "
+                              "a requirement superseded, revised or withdrawn by a later decision",
     "transcript": "System -> Twin. {project, title, turns}",
     "meeting": "PO -> Twin. {text, title, part, turns}: a meeting (or the next part of one) sent in a conversation",
     "draft_board": "Twin -> PO. {drafts}: the requirements of the conversation not yet approved, approved or rejected",

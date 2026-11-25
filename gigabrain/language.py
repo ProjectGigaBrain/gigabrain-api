@@ -49,6 +49,12 @@ PHRASES = {
                       "(repetidos ou que não eram requisitos). {pending} rascunhos esperam sua revisão: aprove, rejeite "
                       "ou diga o que mudar.",
     },
+    "meeting_changes": {
+        "English": " {n} of them change requirements already saved (a later decision): withdraw, supersede or a new version.",
+        "Portuguese": " {n} deles mudam requisitos já gravados (uma decisão posterior): retirar, substituir ou nova versão.",
+    },
+    "change_withdraw": {"English": "Withdraw {target}: {reason}", "Portuguese": "Retirar {target}: {reason}"},
+    "change_supersede": {"English": "{by} supersedes {target}: {reason}", "Portuguese": "{by} substitui {target}: {reason}"},
     "nothing_to_approve": {"English": "There is no proposal to approve yet.", "Portuguese": "Ainda não há proposta para aprovar."},
     "no_expert_yet": {
         "English": "There is no expert yet for: {topics}. It will be created after the meeting; what do you already know about it?",

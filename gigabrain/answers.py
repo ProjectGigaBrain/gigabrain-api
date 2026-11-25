@@ -55,6 +55,8 @@ SHAPES = {
     "twin_draft": {"requirements": [_REQUIREMENT]},
     "twin_revise": {"requirement": _REQUIREMENT},
     "twin_epics": {"epics": [{"title": str, "description": str, "requirements": [str]}]},
+    "twin_reconcile": {"changes": [{"action": _Needed(str), "target": _Needed(str), "by": _Nullable(str),
+                                    "statement": _Nullable(str), "reason": str, "turns": [str]}]},
     "twin_decide": {"save": bool, "statement": str, "class": str, "subtype": _Nullable(str), "links": [_LINK], "motive": str},
     "plain_llm": {"requirements": [{"text": _Needed(str), "class": str, "subtype": _Nullable(str), "turns": [str]}]},
     "leader_decompose": {"subqueries": [{"expert_id": _Nullable(str), "topic": _Needed(str), "description": str, "question": _Needed(str)}]},

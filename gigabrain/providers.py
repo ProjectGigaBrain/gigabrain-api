@@ -343,6 +343,30 @@ class SimulatedProvider:
         return {"epics": [{"title": t.capitalize(), "description": f"Requirements about {t}.", "requirements": ids}
                           for t, ids in epics.items()]}
 
+    def _twin_reconcile(self, messages: list[dict]) -> dict:
+        """An utterance that drops or removes something withdraws the older requirement most like it."""
+        from .evaluation import similarity
+        data = _last(messages)
+        drop = r"\b(remove[ds]?|drop(ped)?|no longer|not anymore|cut|instead of|forget|scrap(ped)?|removid[oa]s?|retirad[oa]s?|n[aã]o vamos mais)\b"
+        changes, used = [], set()
+        for line in data.get("meeting", []):
+            m = re.match(TURN_LINE, line)
+            if not m or not re.search(drop, m.group(3), re.I):
+                continue
+            turn, text = m.group(1), m.group(3)
+            best, score = None, 0.0
+            for item in data.get("repository", []):
+                if item["id"] in used or turn in (item.get("turns") or []):
+                    continue
+                s = similarity(text, item.get("statement") or "")
+                if s > score:
+                    best, score = item, s
+            if best and score >= 0.25:
+                used.add(best["id"])
+                changes.append({"action": "withdraw", "target": best["id"], "by": None, "statement": None,
+                                "reason": "a later decision removed it", "turns": [turn]})
+        return {"changes": changes}
+
     def _twin_revise(self, messages: list[dict]) -> dict:
         """The Critic returned a draft. Rules cannot improve a requirement: the draft goes back as it is."""
         return {"requirement": _last(messages)["draft"]}

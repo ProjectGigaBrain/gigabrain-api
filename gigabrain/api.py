@@ -208,6 +208,17 @@ def _expert_consultations(events: list[dict]) -> dict[str, int]:
 
 # ---------------------------------------------------------------------------- application
 
+def _can_read_forms() -> bool:
+    """Starlette reads multipart forms (attached files) only with python-multipart installed."""
+    for module in ("python_multipart", "multipart"):
+        try:
+            __import__(module)
+            return True
+        except ImportError:
+            continue
+    return False
+
+
 def create_app(data_folder: str, create_provider: Callable[..., object], origins: list[str] | None = None,
                token: str | None = None, validation=True) -> FastAPI:
     active: dict[str, ActiveConversation] = {}
@@ -222,6 +233,9 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
     app = FastAPI(lifespan=lifespan, title="GigaBrain API", version="1.1.0",
                   description="Conversation of the PO with the Digital Twin and history of the Requirements Repository.")
     app.add_middleware(CORSMiddleware, allow_origins=origins or ["*"], allow_methods=["*"], allow_headers=["*"])
+    if not _can_read_forms():
+        print("WARNING: python-multipart is not installed, so messages with attached files will fail. "
+              "Run: pip install -r requirements.txt")
 
     def authorize(authorization: str | None = Header(None)) -> None:
         if token and authorization != f"Bearer {token}":
@@ -315,7 +329,11 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
     async def read_message(request: Request) -> str:
         """The PO's text, from JSON or from a form with attached files (their text goes after it)."""
         if request.headers.get("content-type", "").startswith("multipart/form-data"):
-            form = await request.form()
+            try:
+                form = await request.form()
+            except AssertionError as exc:  # Starlette asserts when python-multipart is missing
+                raise HTTPException(500, "Attached files need the python-multipart package: "
+                                         "run pip install -r requirements.txt and restart the API.") from exc
             text = str(form.get("text") or "")
             uploads = [f for f in form.getlist("files") if hasattr(f, "read")]
             if len(uploads) > documents.MAX_FILES:
@@ -559,7 +577,7 @@ def create_app(data_folder: str, create_provider: Callable[..., object], origins
     # ------------------------------------------------------------------ requirements
 
     @app.get("/api/v1/projects/{project_id}/requirements", tags=["history"], dependencies=protected)
-    def list_requirements(project_id: str, status: str | None = Query(None, description="active, under_review, superseded, split, merged"),
+    def list_requirements(project_id: str, status: str | None = Query(None, description="active, under_review, superseded, split, merged, withdrawn"),
                           topic: str | None = None, search: str | None = Query(None, description="free text"),
                           db: Database = Depends(get_db)) -> list[dict]:
         requirements = [_requirement_summary(r) for r in db.list_requirements()]

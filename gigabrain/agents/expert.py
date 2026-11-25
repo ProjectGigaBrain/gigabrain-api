@@ -212,6 +212,23 @@ class Expert(Agent):
             version = self.update({"kind": "reorganize"}, "periodic reorganization") or version
         return version
 
+    def note_change(self, outcome: dict) -> int | None:
+        """A later decision changed a requirement of the topic (reconcile.py): write it down without the LLM."""
+        self.sync()
+        md = self.read_knowledge()
+        target, reason = outcome["target"], outcome.get("reason") or ""
+        if outcome["action"] == "withdraw":
+            note = f"{target} withdrawn: {reason}"
+        elif outcome["action"] == "supersede":
+            note = f"{outcome['by']} supersedes {target}: {reason}"
+        else:
+            note = f"{target} v{outcome['version']}: {reason}"
+            md = knowledge.add_item(md, "Approved requirements", f"{target} v{outcome['version']} — {outcome['statement']}")
+        md = knowledge.add_item(md, "Decisions (and why)", note)
+        for rid in outcome.get("under_review") or []:
+            md = knowledge.add_item(md, "Open points", f"{rid} must be reviewed because {target} changed")
+        return self._store(md, f"{target} {outcome['action']}", {"trigger": "reconciliation", "changes": [note]})
+
     def similar_from_other_topics(self, text: str, limit: int = 5) -> list[dict]:
         """Requirements of other topics with words in common: duplicates may cross topics."""
         from ..evaluation import similarity

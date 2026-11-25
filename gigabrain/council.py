@@ -20,9 +20,14 @@ Drafts (D1, D2...) are the working list of the conversation. The PO changes them
 restore. Approving saves a draft in the Repository and the conversation goes on, so the PO can
 keep talking, send more meetings and approve again.
 
+After each part of a meeting, the Twin reads it as a whole against the Repository (reconcile.py):
+a later decision that makes a saved requirement obsolete becomes a draft too ("withdraw R7",
+"R50 supersedes R32", a new version of R32), and a pending draft that a later utterance dropped
+is rejected (the PO can restore it).
+
 When a draft is approved:
 1. it is saved (new requirement or new version), with its sources (conversation, utterances,
-   experts consulted, the Critic's report) and links
+   experts consulted, the Critic's report) and links; a change draft withdraws or supersedes
 2. requirements that depended on one that changed become "under_review"
 3. the experts of the topics involved update their knowledge file
 """
@@ -32,7 +37,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
-from . import requirement_format, transcript
+from . import reconcile, requirement_format, transcript
 from .agents import Context, DigitalTwin, Expert, Leader
 from .agents.base import as_json
 from .agents.twin import DRAFTS_NOTE
@@ -275,10 +280,17 @@ class Council:
                 draft_id, was_changed = self._put(requirement, "meeting", sources, replaces)
                 (changed if was_changed else new).append(draft_id)
 
+        reconciled = self._reconcile(new_turns, utterances, code, language, part)
+        new += reconciled["new"]
+        changed += [d for d in reconciled["changed"] if d not in changed]
+        discarded += reconciled["dropped"]
+
         self._record_board()
         pending = self.pending_proposal or []
         message = phrase("meeting_read", language, utterances=len(new_turns), new=len(new), changed=len(changed),
                          discarded=discarded, pending=len(pending))
+        if reconciled["count"]:
+            message += phrase("meeting_changes", language, n=reconciled["count"])
         action = "propose" if pending else "ask"
         if pending:
             self.twin.send(PO, "proposal", {"text": message, "requirements": pending})
@@ -288,6 +300,49 @@ class Council:
         self.twin.history.append({"role": "user", "content": as_json({"from": "system", "notice": message})})
         return {"action": action, "message_to_po": message, "requirements": pending, "new": new, "changed": changed,
                 "discarded": discarded}
+
+    def _reconcile(self, turns: list[dict], utterances: dict[str, str], code: str, language: str | None, part: int) -> dict:
+        """What this part of the meeting made obsolete. Nothing is saved: changes to the Repository
+        become drafts for the PO, and a pending draft a later utterance dropped is rejected."""
+        pending = [d for d in self.drafts if d["status"] == "pending"]
+        out = {"new": [], "changed": [], "dropped": 0, "count": 0}
+        for change in reconcile.run(self.ctx, self.twin, turns, code, pending):
+            target, by = change["target"], change.get("by")
+            sources = [{"kind": "turn", "ref": t, "meeting": part} for t in change["turns"]]
+            if target.startswith("D"):  # a pending draft: no requirement exists yet
+                draft = self._draft(target)
+                if change["action"] == "revise":
+                    draft["requirement"] = {**draft["requirement"], "statement": change["statement"]}
+                    draft["revision"] = draft.get("revision", 1) + 1
+                    out["changed"].append(target)
+                else:
+                    draft["status"], draft["note"] = "rejected", change["reason"]
+                    out["dropped"] += 1
+                out["count"] += 1
+                continue
+            if change["action"] == "supersede" and by.startswith("D"):  # the newer draft carries the link
+                draft = self._draft(by)
+                links = draft["requirement"].get("links") or []
+                if not any(l.get("kind") == "supersedes" and l.get("target") == target for l in links):
+                    draft["requirement"]["links"] = [*links, {"kind": "supersedes", "target": target, "reason": change["reason"]}]
+                    draft["sources"] = draft["sources"] + [s for s in sources if s not in draft["sources"]]
+                out["changed"].append(by)
+                out["count"] += 1
+                continue
+            req = self.ctx.db.get_requirement(target)
+            if change["action"] == "revise":
+                requirement = {**reconcile.revised_content(self.ctx, self.twin, target, change, utterances, code),
+                               "base": target, "links": [], "reason": change["reason"]}
+            else:
+                key = "change_withdraw" if change["action"] == "withdraw" else "change_supersede"
+                text = phrase(key, language, target=target, by=by, reason=change["reason"])
+                requirement = {"title": text, "statement": text, "kind": "change", "topics": req["topics"],
+                               "turns": change["turns"], "reason": change["reason"],
+                               "change": {k: change[k] for k in ("action", "target", "by", "reason", "turns")}}
+            draft_id, _ = self._put(requirement, "meeting", sources)
+            out["new"].append(draft_id)
+            out["count"] += 1
+        return out
 
     def _repeats_a_draft(self, statement: str) -> bool:
         from .evaluation import similarity
@@ -314,6 +369,18 @@ class Council:
         saved = []
         for draft in chosen:
             proposed = draft["requirement"]
+            if proposed.get("change"):  # withdraw or supersede a saved requirement
+                change = {**proposed["change"], "by": resolve(proposed["change"].get("by"))}
+                outcome = reconcile.apply(self.ctx, self.twin, change, {}, self.twin.language, "po (explicit approval)",
+                                          [{"kind": "conversation", "ref": self.ctx.conversation_id}])
+                draft["status"] = "approved" if outcome else "rejected"
+                if not outcome:
+                    draft["note"] = f"{change['target']} could not be changed (it no longer holds)"
+                    continue
+                draft["saved_as"] = change["target"]
+                saved.append({"requirement_id": change["target"], "version": None, "change": outcome["action"],
+                              "under_review": outcome["under_review"], "links": []})
+                continue
             content = {k: proposed[k] for k in REQUIREMENT_FIELDS if k in proposed}
             sources = [{"kind": "conversation", "ref": self.ctx.conversation_id}, *draft.get("sources", [])]
             if proposed.get("validation") and proposed["validation"].get("report_id"):  # which report of the Critic it was approved with
@@ -336,7 +403,8 @@ class Council:
                 self._update_experts(result)
             saved.append(result)
 
-        text = phrase("saved", self.twin.language, ids=", ".join(f"{s['requirement_id']} v{s['version']}" for s in saved))
+        label = lambda s: f"{s['requirement_id']} ({s['change']})" if s.get("change") else f"{s['requirement_id']} v{s['version']}"
+        text = phrase("saved", self.twin.language, ids=", ".join(label(s) for s in saved))
         _record(self.ctx, TWIN, PO, "confirmation", {"text": text, "saved": [s["requirement_id"] for s in saved]})
         self._record_board()
         self.ctx.db.set_conversation_status(self.ctx.conversation_id, "approved")
